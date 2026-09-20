@@ -131,29 +131,131 @@ def get_share_link_info(share_id):
 
 
 def is_share_valid(share):
-    """检查分享链接是否有效"""
+    """检查分享链接是否有效。
+
+    这是唯一的有效性判定入口，公开详情、创建者列表和取件
+    必须共用它，保证同一链接在任何地方给出相同状态。
+    判断一律使用服务器端 epoch 秒时间戳，与客户端时区、
+    跨天无关。
+    """
     if not share:
         return False, '分享链接不存在'
 
     if share['expires_at'] is not None and share['expires_at'] < time.time():
         return False, '分享链接已过期'
 
-    if share['max_downloads'] is not None and share['download_count'] >= share['max_downloads']:
+    download_count = share['download_count'] or 0
+    if share['max_downloads'] is not None and download_count >= share['max_downloads']:
         return False, '分享链接下载次数已用完'
 
     return True, None
 
 
-def increment_download_count(share_id):
-    """增加下载次数"""
-    conn = get_db()
+def try_consume_share_download(conn, share_id):
+    """原子地占用一次下载配额。
+
+    用单条条件 UPDATE 同时完成“是否还能下载”的判断和
+    计数 +1，消除“先检查后计数”的竞态（TOCTOU），
+    并发取件、重复提交都不会让 download_count 超过
+    max_downloads。未设上限（max_downloads IS NULL）或
+    永久有效（expires_at IS NULL）的链接不受限制。
+
+    返回 (ok, reason, new_count)。
+    """
+    now = time.time()
     cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE share_links
+        SET download_count = COALESCE(download_count, 0) + 1
+        WHERE id = ?
+          AND (expires_at IS NULL OR expires_at >= ?)
+          AND (max_downloads IS NULL OR COALESCE(download_count, 0) < max_downloads)
+    ''', (share_id, now))
+
+    if cursor.rowcount == 1:
+        conn.commit()
+        cursor.execute(
+            'SELECT download_count FROM share_links WHERE id = ?',
+            (share_id,)
+        )
+        return True, None, cursor.fetchone()['download_count']
+
+    # 未占用成功，查明具体原因，保持与 is_share_valid 相同的错误语义
     cursor.execute(
-        'UPDATE share_links SET download_count = download_count + 1 WHERE id = ?',
+        'SELECT expires_at, max_downloads, download_count FROM share_links WHERE id = ?',
         (share_id,)
     )
-    conn.commit()
-    conn.close()
+    row = cursor.fetchone()
+    if row is None:
+        return False, '分享链接不存在', 0
+    if row['expires_at'] is not None and now >= row['expires_at']:
+        return False, '分享链接已过期', row['download_count']
+    return False, '分享链接下载次数已用完', row['download_count']
+
+
+def serialize_share(share):
+    """把分享记录序列化为对外统一结构。
+
+    创建者列表（/api/shares）和公开详情（/api/share/<id>）
+    都必须经过这里，确保同一链接的状态、次数、剩余量等
+    字段完全一致，不存在两处各拼一套的情况。
+    """
+    valid, error_msg = is_share_valid(share)
+    download_count = share['download_count'] or 0
+    remaining = None
+    if share['max_downloads'] is not None:
+        remaining = max(0, share['max_downloads'] - download_count)
+
+    return {
+        'share_id': share['id'],
+        'file_id': share['file_id'],
+        'filename': share['filename'],
+        'filesize': share['filesize'],
+        'created_by': share['created_by'],
+        'expires_at': share['expires_at'],
+        'max_downloads': share['max_downloads'],
+        'download_count': download_count,
+        'remaining_downloads': remaining,
+        'created_at': share['created_at'],
+        'is_valid': valid,
+        'error_msg': error_msg
+    }
+
+
+def normalize_expire_hours(expire_hours):
+    """规范化有效期参数：None 用默认值，负数表示永久，0/非法拒绝。
+
+    返回 (expire_hours, error)；expire_hours 为 None 表示永久有效。
+    """
+    if expire_hours is None:
+        expire_hours = SHARE_LINK_EXPIRE_HOURS
+    try:
+        expire_hours = int(expire_hours)
+    except (TypeError, ValueError):
+        return None, '有效期格式不正确'
+    if expire_hours < 0:
+        return None, None  # -1 表示永久有效
+    if expire_hours == 0:
+        return None, '有效期必须大于 0（如需长期有效请选择永久有效）'
+    return expire_hours, None
+
+
+def normalize_max_downloads(max_downloads):
+    """规范化下载次数参数：None 用默认值，负数表示无限制，0 拒绝。
+
+    返回 (max_downloads, error)；max_downloads 为 None 表示无限制。
+    """
+    if max_downloads is None:
+        max_downloads = SHARE_LINK_MAX_DOWNLOADS
+    try:
+        max_downloads = int(max_downloads)
+    except (TypeError, ValueError):
+        return None, '下载次数格式不正确'
+    if max_downloads < 0:
+        return None, None  # -1 表示无限制
+    if max_downloads == 0:
+        return None, '最大下载次数不能为 0（如需不限次数请选择无限制）'
+    return max_downloads, None
 
 
 def get_token_from_request():
@@ -188,22 +290,20 @@ def create_share():
         conn.close()
         return jsonify({'error': '文件不存在'}), 404
 
-    if expire_hours is None:
-        expire_hours = SHARE_LINK_EXPIRE_HOURS
-
-    if expire_hours < 0:
-        expire_hours = None
+    expire_hours, expire_error = normalize_expire_hours(expire_hours)
+    if expire_error:
+        conn.close()
+        return jsonify({'error': expire_error}), 400
 
     if expire_hours is not None:
         expires_at = time.time() + expire_hours * 3600
     else:
         expires_at = None
 
-    if max_downloads is None:
-        max_downloads = SHARE_LINK_MAX_DOWNLOADS
-
-    if max_downloads < 0:
-        max_downloads = None
+    max_downloads, downloads_error = normalize_max_downloads(max_downloads)
+    if downloads_error:
+        conn.close()
+        return jsonify({'error': downloads_error}), 400
 
     token = get_token_from_request()
     username = get_username_from_token(token)
@@ -233,54 +333,66 @@ def create_share():
 def get_share(share_id):
     """获取分享链接信息（公开访问）"""
     share = get_share_link_info(share_id)
-    valid, error_msg = is_share_valid(share)
 
     if not share:
         return jsonify({'error': '分享链接不存在'}), 404
 
-    share_data = {
-        'share_id': share['id'],
-        'filename': share['filename'],
-        'filesize': share['filesize'],
-        'created_by': share['created_by'],
-        'expires_at': share['expires_at'],
-        'max_downloads': share['max_downloads'],
-        'download_count': share['download_count'],
-        'created_at': share['created_at'],
-        'is_valid': valid,
-        'error_msg': error_msg
-    }
-
-    return jsonify(share_data)
+    # 与创建者列表共用同一序列化/判定逻辑，状态必然一致
+    return jsonify(serialize_share(share))
 
 
 @files_bp.route('/api/share/<share_id>/download', methods=['GET'])
 def download_by_share(share_id):
-    """通过分享链接下载文件（公开访问）"""
-    share = get_share_link_info(share_id)
-    valid, error_msg = is_share_valid(share)
+    """通过分享链接下载文件（公开访问）。
 
-    if not valid:
-        return jsonify({'error': error_msg}), 404
-
+    计数更新与有效性判断在同一个事务中原子完成，
+    并发取件或重复提交都不会超过 max_downloads。
+    """
     conn = get_db()
     cursor = conn.cursor()
+    cursor.execute('''
+        SELECT s.id, s.file_id, s.created_by, s.expires_at,
+               s.max_downloads, s.download_count, s.created_at,
+               f.name as filename, f.size as filesize
+        FROM share_links s
+        JOIN files f ON s.file_id = f.id
+        WHERE s.id = ?
+    ''', (share_id,))
+    share = cursor.fetchone()
+
+    if not share:
+        conn.close()
+        return jsonify({'error': '分享链接不存在'}), 404
+
+    # 快速预检，给出与详情页一致的错误信息（过期优先于次数用完）
+    valid, error_msg = is_share_valid(share)
+    if not valid:
+        conn.close()
+        return jsonify({'error': error_msg}), 404
+
     cursor.execute('SELECT name, path FROM files WHERE id = ?', (share['file_id'],))
     file_info = cursor.fetchone()
-    conn.close()
 
     if not file_info:
+        conn.close()
         return jsonify({'error': '文件不存在'}), 404
 
     if not os.path.abspath(file_info['path']).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        conn.close()
         return jsonify({'error': '非法文件路径'}), 403
 
     if not os.path.exists(file_info['path']):
+        conn.close()
         return jsonify({'error': '文件不存在'}), 404
 
-    increment_download_count(share_id)
+    # 原子占用配额：并发请求中只有真正抢到名额的才会走到发送文件
+    ok, reason, new_count = try_consume_share_download(conn, share_id)
+    conn.close()
 
-    logger.info(f"分享下载: 文件 {file_info['name']}, 分享ID {share_id}, 下载次数 {share['download_count'] + 1}")
+    if not ok:
+        return jsonify({'error': reason}), 404
+
+    logger.info(f"分享下载: 文件 {file_info['name']}, 分享ID {share_id}, 下载次数 {new_count}")
     return send_file(file_info['path'], as_attachment=True, download_name=file_info['name'])
 
 
@@ -304,21 +416,8 @@ def list_shares():
     shares = cursor.fetchall()
     conn.close()
 
-    result = []
-    for share in shares:
-        valid, error_msg = is_share_valid(share)
-        result.append({
-            'share_id': share['id'],
-            'file_id': share['file_id'],
-            'filename': share['filename'],
-            'filesize': share['filesize'],
-            'expires_at': share['expires_at'],
-            'max_downloads': share['max_downloads'],
-            'download_count': share['download_count'],
-            'created_at': share['created_at'],
-            'is_valid': valid,
-            'error_msg': error_msg
-        })
+    # 与公开详情共用同一序列化/判定逻辑，保证状态一致
+    result = [serialize_share(share) for share in shares]
 
     return jsonify(result)
 

@@ -534,8 +534,12 @@ async function loadMyShares() {
         }
         
         list.innerHTML = shares.map(share => {
+            // 状态完全使用服务器返回，与公开页同源，不做本地推算
             const statusClass = share.is_valid ? 'valid' : 'invalid';
             const statusText = share.is_valid ? '有效' : (share.error_msg || '无效');
+            const downloadsText = share.max_downloads
+                ? `${share.download_count} / ${share.max_downloads}（剩 ${share.remaining_downloads ?? Math.max(0, share.max_downloads - share.download_count)} 次）`
+                : `${share.download_count} / ∞`;
             
             return `
                 <div class="share-item">
@@ -550,7 +554,7 @@ async function loadMyShares() {
                         </div>
                         <div class="share-item-detail">
                             <span class="share-item-detail-label">已下载</span>
-                            <span class="share-item-detail-value">${share.download_count} / ${share.max_downloads || '∞'}</span>
+                            <span class="share-item-detail-value">${downloadsText}</span>
                         </div>
                         <div class="share-item-detail">
                             <span class="share-item-detail-label">创建时间</span>

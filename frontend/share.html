@@ -71,6 +71,7 @@
         const API_BASE = CONFIG.API_BASE;
         let currentShareId = null;
         let shareInfo = null;
+        let isDownloading = false;
 
         // 显示加载动画
         function showLoading(text = '加载中...') {
@@ -129,11 +130,16 @@
         async function loadShareInfo() {
             // 从 URL hash 获取 share_id
             currentShareId = window.location.hash.substring(1);
-            
+
             if (!currentShareId) {
+                resetViews();
                 showError('无效链接', '请检查您的分享链接是否完整');
                 return;
             }
+
+            // 每次加载都先复位三个视图，避免上一次渲染的内容
+            // （如下载次数）残留在页面上造成“恢复可用/重复显示”的错觉
+            resetViews();
 
             try {
                 const response = await fetch(`${API_BASE}/share/${currentShareId}`);
@@ -145,7 +151,10 @@
                 }
 
                 if (!shareInfo.is_valid) {
+                    // 状态完全以服务器返回为准：过期/次数用完都展示失效页，
+                    // 不保留任何可下载内容
                     showError('链接已失效', shareInfo.error_msg || '该分享链接已过期或下载次数已用完');
+                    setDownloadButton(false);
                     return;
                 }
 
@@ -155,9 +164,25 @@
             }
         }
 
+        // 复位三个互斥视图
+        function resetViews() {
+            document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('errorState').style.display = 'none';
+            document.getElementById('shareContent').style.display = 'none';
+        }
+
+        // 切换下载按钮可用状态（防止重复提交）
+        function setDownloadButton(enabled) {
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = !enabled;
+            btn.style.opacity = enabled ? '1' : '0.5';
+            btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+            btn.querySelector('span').textContent = enabled ? '⬇️ 下载文件' : '⏳ 处理中...';
+        }
+
         // 显示错误状态
         function showError(title, message) {
-            document.getElementById('loadingState').style.display = 'none';
+            resetViews();
             document.getElementById('errorState').style.display = 'block';
             document.getElementById('errorTitle').textContent = title;
             document.getElementById('errorMessage').textContent = message;
@@ -165,41 +190,54 @@
 
         // 显示分享内容
         function showShareContent(info) {
-            document.getElementById('loadingState').style.display = 'none';
+            resetViews();
             document.getElementById('shareContent').style.display = 'block';
+            isDownloading = false;
+            setDownloadButton(true);
 
             document.getElementById('fileIcon').textContent = getFileIcon(info.filename);
             document.getElementById('fileName').textContent = escapeHtml(info.filename);
             document.getElementById('fileSize').textContent = formatSize(info.filesize);
             document.getElementById('sharedBy').textContent = escapeHtml(info.created_by);
             document.getElementById('expireTime').textContent = formatTimestamp(info.expires_at);
-            document.getElementById('downloadCount').textContent = 
-                info.max_downloads ? `${info.download_count} / ${info.max_downloads} 次` : `${info.download_count} 次（无限制）`;
+
+            const remaining = (info.remaining_downloads === null || info.remaining_downloads === undefined)
+                ? null : info.remaining_downloads;
+            if (info.max_downloads) {
+                document.getElementById('downloadCount').textContent =
+                    `已用 ${info.download_count} / ${info.max_downloads} 次（剩余 ${remaining} 次）`;
+            } else {
+                document.getElementById('downloadCount').textContent =
+                    `已下载 ${info.download_count} 次（无限制）`;
+            }
         }
 
         // 下载文件
         async function downloadFile() {
             if (!currentShareId) return;
-
+            // 防止快速连点/重复提交：一次取件过程中忽略后续点击
+            if (isDownloading) return;
+            isDownloading = true;
+            setDownloadButton(false);
             showLoading('准备下载...');
 
             try {
                 const response = await fetch(`${API_BASE}/share/${currentShareId}/download`);
-                
+
                 if (!response.ok) {
-                    const result = await response.json();
+                    const result = await response.json().catch(() => ({}));
                     hideLoading();
-                    alert(`下载失败: ${result.error || '未知错误'}`);
-                    
-                    // 重新加载分享信息，可能是过期了
-                    loadShareInfo();
+                    // 服务器是状态的唯一来源：已用完/过期直接切换到失效页，
+                    // 不再停留在可下载内容上
+                    resetViews();
+                    showError('链接已失效', result.error || '该分享链接已过期或下载次数已用完');
                     return;
                 }
 
                 const blob = await response.blob();
                 const contentDisposition = response.headers.get('Content-Disposition');
                 let filename = shareInfo ? shareInfo.filename : 'download';
-                
+
                 if (contentDisposition) {
                     const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
                     if (match) filename = decodeURIComponent(match[1]);
@@ -216,12 +254,13 @@
 
                 hideLoading();
 
-                // 刷新分享信息，更新下载次数
-                setTimeout(() => {
-                    loadShareInfo();
-                }, 500);
+                // 重新从服务器加载权威状态，更新下载次数；
+                // 若这是最后一次取件，会直接渲染为失效页
+                setTimeout(loadShareInfo, 500);
             } catch (error) {
                 hideLoading();
+                isDownloading = false;
+                setDownloadButton(true);
                 alert(`下载失败: ${error.message}`);
             }
         }

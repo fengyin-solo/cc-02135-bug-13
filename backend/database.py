@@ -6,8 +6,11 @@ from config import DB_FILE
 
 def get_db():
     """获取数据库连接"""
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.row_factory = sqlite3.Row
+    # WAL 模式 + 忙等，降低并发写入时的锁冲突
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=10000')
     return conn
 
 

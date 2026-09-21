@@ -386,19 +386,45 @@ function formatTimestamp(timestamp) {
 function formatRemainingTime(expiresAt) {
     if (!expiresAt) return '永久';
     const remaining = expiresAt - (Date.now() / 1000);
+    // 与后端一致：到点即过期（<= 0），避免临界时刻两边状态对不上
     if (remaining <= 0) return '已过期';
-    
+
     const hours = Math.floor(remaining / 3600);
     const minutes = Math.floor((remaining % 3600) / 60);
-    
+
     if (hours > 24) {
         const days = Math.floor(hours / 24);
         return `${days} 天 ${hours % 24} 小时`;
     } else if (hours > 0) {
         return `${hours} 小时 ${minutes} 分钟`;
-    } else {
+    } else if (minutes > 0) {
         return `${minutes} 分钟`;
+    } else {
+        return '不足 1 分钟';
     }
+}
+
+// 分享状态展示（创建者列表与公开页共用同一判定来源：后端返回的 is_valid/error_msg）
+function getShareStatus(share) {
+    if (share.is_valid) {
+        return { className: 'valid', text: '有效' };
+    }
+    const reason = share.error_msg || '';
+    if (reason.includes('过期')) {
+        return { className: 'invalid', text: '已过期' };
+    }
+    if (reason.includes('用完')) {
+        return { className: 'invalid', text: '已用完' };
+    }
+    return { className: 'invalid', text: reason || '无效' };
+}
+
+// 下载次数展示（后端是唯一数据源，避免前端各自换算造成不一致）
+function formatDownloadCount(share) {
+    if (share.max_downloads == null) {
+        return `${share.download_count} / ∞`;
+    }
+    return `${share.download_count} / ${share.max_downloads}`;
 }
 
 // 打开分享设置弹窗
@@ -507,41 +533,46 @@ async function copyShareLink() {
     }
 }
 
-// 加载我的分享列表
+// 加载我的分享
+let mySharesRequestSeq = 0;
 async function loadMyShares() {
     const section = document.getElementById('mySharesSection');
     const list = document.getElementById('mySharesList');
-    
+
     if (!(await TokenManager.isValid())) {
         section.style.display = 'none';
         return;
     }
-    
+
     section.style.display = 'block';
-    
+
+    // 序号守卫：快速连续刷新时只渲染最后一次响应，避免旧数据覆盖或重复显示
+    const requestSeq = ++mySharesRequestSeq;
+
     try {
         const response = await fetch(`${API_BASE}/shares`, {
             headers: {
                 'Authorization': `Bearer ${TokenManager.get()}`
             }
         });
-        
+
         const shares = await response.json();
-        
-        if (shares.length === 0) {
+
+        if (requestSeq !== mySharesRequestSeq) return;
+
+        if (!Array.isArray(shares) || shares.length === 0) {
             list.innerHTML = '<p class="empty-msg">暂无分享链接</p>';
             return;
         }
-        
+
         list.innerHTML = shares.map(share => {
-            const statusClass = share.is_valid ? 'valid' : 'invalid';
-            const statusText = share.is_valid ? '有效' : (share.error_msg || '无效');
-            
+            const status = getShareStatus(share);
+
             return `
                 <div class="share-item">
                     <div class="share-item-header">
                         <span class="share-item-filename">${escapeHtml(share.filename)}</span>
-                        <span class="share-item-status ${statusClass}">${statusText}</span>
+                        <span class="share-item-status ${status.className}">${status.text}</span>
                     </div>
                     <div class="share-item-details">
                         <div class="share-item-detail">
@@ -550,7 +581,7 @@ async function loadMyShares() {
                         </div>
                         <div class="share-item-detail">
                             <span class="share-item-detail-label">已下载</span>
-                            <span class="share-item-detail-value">${share.download_count} / ${share.max_downloads || '∞'}</span>
+                            <span class="share-item-detail-value">${formatDownloadCount(share)}</span>
                         </div>
                         <div class="share-item-detail">
                             <span class="share-item-detail-label">创建时间</span>
@@ -569,7 +600,9 @@ async function loadMyShares() {
             `;
         }).join('');
     } catch (error) {
-        list.innerHTML = `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
+        if (requestSeq === mySharesRequestSeq) {
+            list.innerHTML = `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
+        }
     }
 }
 

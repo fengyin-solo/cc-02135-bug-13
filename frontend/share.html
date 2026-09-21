@@ -71,6 +71,8 @@
         const API_BASE = CONFIG.API_BASE;
         let currentShareId = null;
         let shareInfo = null;
+        let isDownloading = false;
+        let loadRequestSeq = 0;
 
         // 显示加载动画
         function showLoading(text = '加载中...') {
@@ -125,39 +127,71 @@
             });
         }
 
-        // 获取分享链接信息
+        // 下载次数展示：以后端返回为准，前端不自行换算
+        function formatDownloadCount(info) {
+            if (info.max_downloads == null) {
+                return `${info.download_count} 次（无限制）`;
+            }
+            return `${info.download_count} / ${info.max_downloads} 次`;
+        }
+
+        // 失效原因映射为页面标题
+        function getErrorTitle(reason) {
+            if (reason && reason.includes('过期')) return '链接已过期';
+            if (reason && reason.includes('用完')) return '下载次数已用完';
+            return '链接已失效';
+        }
+
+        // 获取分享链接信息（公开页与创建者列表看到的状态由同一后端接口逻辑保证一致）
         async function loadShareInfo() {
-            // 从 URL hash 获取 share_id
             currentShareId = window.location.hash.substring(1);
-            
+
             if (!currentShareId) {
                 showError('无效链接', '请检查您的分享链接是否完整');
                 return;
             }
 
+            // 序号守卫：快速刷新（如下载成功后刷新 + 手动刷新）时只渲染最新一次结果，
+            // 避免旧响应覆盖新状态造成“次数重复显示/状态回退”
+            const requestSeq = ++loadRequestSeq;
+
             try {
-                const response = await fetch(`${API_BASE}/share/${currentShareId}`);
-                shareInfo = await response.json();
+                const response = await fetch(`${API_BASE}/share/${currentShareId}`, {
+                    cache: 'no-store'
+                });
+                const info = await response.json();
+
+                if (requestSeq !== loadRequestSeq) return;
 
                 if (!response.ok) {
-                    showError('链接不存在', '该分享链接不存在');
+                    showError('链接不存在', (info && info.error) || '该分享链接不存在');
                     return;
                 }
 
-                if (!shareInfo.is_valid) {
-                    showError('链接已失效', shareInfo.error_msg || '该分享链接已过期或下载次数已用完');
+                shareInfo = info;
+
+                if (!info.is_valid) {
+                    // 已失效（过期/次数用完）：立即展示失效页，任何刷新都不会恢复可下载状态
+                    showError(
+                        getErrorTitle(info.error_msg),
+                        info.error_msg || '该分享链接已过期或下载次数已用完'
+                    );
+                    setDownloadButtonEnabled(false);
                     return;
                 }
 
-                showShareContent(shareInfo);
+                showShareContent(info);
             } catch (error) {
-                showError('加载失败', `无法加载分享信息: ${error.message}`);
+                if (requestSeq === loadRequestSeq) {
+                    showError('加载失败', `无法加载分享信息: ${error.message}`);
+                }
             }
         }
 
         // 显示错误状态
         function showError(title, message) {
             document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('shareContent').style.display = 'none';
             document.getElementById('errorState').style.display = 'block';
             document.getElementById('errorTitle').textContent = title;
             document.getElementById('errorMessage').textContent = message;
@@ -166,6 +200,7 @@
         // 显示分享内容
         function showShareContent(info) {
             document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('errorState').style.display = 'none';
             document.getElementById('shareContent').style.display = 'block';
 
             document.getElementById('fileIcon').textContent = getFileIcon(info.filename);
@@ -173,33 +208,57 @@
             document.getElementById('fileSize').textContent = formatSize(info.filesize);
             document.getElementById('sharedBy').textContent = escapeHtml(info.created_by);
             document.getElementById('expireTime').textContent = formatTimestamp(info.expires_at);
-            document.getElementById('downloadCount').textContent = 
-                info.max_downloads ? `${info.download_count} / ${info.max_downloads} 次` : `${info.download_count} 次（无限制）`;
+            document.getElementById('downloadCount').textContent = formatDownloadCount(info);
+            setDownloadButtonEnabled(true);
+        }
+
+        function setDownloadButtonEnabled(enabled) {
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = !enabled;
+            btn.style.opacity = enabled ? '1' : '0.5';
+            btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
         }
 
         // 下载文件
         async function downloadFile() {
-            if (!currentShareId) return;
+            if (!currentShareId || isDownloading) return;
 
+            // 以本地最新状态再确认一次，剩 0 次/已过期直接拦截，不发取件请求
+            if (shareInfo && !shareInfo.is_valid) {
+                showError(
+                    getErrorTitle(shareInfo.error_msg),
+                    shareInfo.error_msg || '该分享链接已失效'
+                );
+                return;
+            }
+
+            isDownloading = true;
+            setDownloadButtonEnabled(false);
             showLoading('准备下载...');
 
             try {
-                const response = await fetch(`${API_BASE}/share/${currentShareId}/download`);
-                
+                const response = await fetch(`${API_BASE}/share/${currentShareId}/download`, {
+                    cache: 'no-store'
+                });
+
                 if (!response.ok) {
-                    const result = await response.json();
+                    let message = '未知错误';
+                    try {
+                        const result = await response.json();
+                        message = result.error || message;
+                    } catch (e) { /* 忽略非 JSON 错误体 */ }
                     hideLoading();
-                    alert(`下载失败: ${result.error || '未知错误'}`);
-                    
-                    // 重新加载分享信息，可能是过期了
-                    loadShareInfo();
+                    alert(`下载失败: ${message}`);
+
+                    // 立即以后端最新状态重新渲染（过期或次数用完会直接切到失效页）
+                    await loadShareInfo();
                     return;
                 }
 
                 const blob = await response.blob();
                 const contentDisposition = response.headers.get('Content-Disposition');
                 let filename = shareInfo ? shareInfo.filename : 'download';
-                
+
                 if (contentDisposition) {
                     const match = contentDisposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\n]+)/i);
                     if (match) filename = decodeURIComponent(match[1]);
@@ -216,13 +275,14 @@
 
                 hideLoading();
 
-                // 刷新分享信息，更新下载次数
-                setTimeout(() => {
-                    loadShareInfo();
-                }, 500);
+                // 刷新为后端最新计数；若这是最后一次，页面会立即变为失效态
+                await loadShareInfo();
             } catch (error) {
                 hideLoading();
                 alert(`下载失败: ${error.message}`);
+                setDownloadButtonEnabled(shareInfo ? shareInfo.is_valid : true);
+            } finally {
+                isDownloading = false;
             }
         }
 
